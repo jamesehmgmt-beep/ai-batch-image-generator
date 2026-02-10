@@ -80,6 +80,8 @@ There are two modes for how source images are used:
 - "same pose as", "use face from" → reference
 - "put [item] on model" → analysis
 - "replace background", "change setting" → reference
+- "use as reference", "use each image as reference", "use image as reference photo" → reference (OVERRIDES other signals — user explicitly requests reference mode)
+- When user says both "use as reference" AND "put on model/human", PRIORITIZE the explicit reference mode request
 - When unclear, default to "reference"
 
 ## Models Available

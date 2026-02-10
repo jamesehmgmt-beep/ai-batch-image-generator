@@ -189,13 +189,16 @@ export async function POST(req: NextRequest) {
 
         let allReferenceUrls: string[];
 
-        if (photoMode === 'analysis') {
-          // ANALYSIS MODE: Include ALL valid folder files (excluding excluded ones) as references for context
+        if (photoMode === 'analysis' && generationsPerFile <= 1) {
+          // ANALYSIS MODE with single generation per image: Include ALL valid folder files for context
           // Source file first, then all other files from folder, then user's extra references
           const otherValidFiles = validFiles.filter((f: string) => f !== fileUrl);
           allReferenceUrls = [fileUrl, ...otherValidFiles, ...validatedReferenceUrls].slice(0, 8);
         } else {
-          // REFERENCE MODE: Only the source file + user's extra references
+          // REFERENCE MODE or MULTIPLE VARIATIONS per image:
+          // Only the source file + user's extra references.
+          // When creating variations per image (generationsPerFile > 1), each image's
+          // variations should only reference that specific source image, not all folder images.
           allReferenceUrls = [fileUrl, ...validatedReferenceUrls].slice(0, 8);
         }
 
