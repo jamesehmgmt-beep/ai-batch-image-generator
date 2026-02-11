@@ -1,119 +1,28 @@
 // lib/ai/prompt-generator.ts
 // Purpose: Centralized per-generation prompt creation
-// Phase 25: Simple pass-through implementation
-// Phase 26: Enhanced with intent analysis
+// Phase 27: ONE Claude call generates ALL unique prompts per folder
 
 import { getAnthropicClient, CLAUDE_MODEL, withRetry } from './anthropic';
-import { IntentAnalysis, IntentMode, buildIntentAnalysisPrompt } from './prompts/intent-analysis';
-
-export interface PromptGenerationOptions {
-  /** Base prompt from folder operation */
-  folderOperation: string;
-  /** Source file name for this generation */
-  fileName: string;
-  /** Image URL for analysis (optional) */
-  imageUrl?: string;
-  /** Photo mode: reference or analysis */
-  photoMode: 'reference' | 'analysis';
-  // Phase 26: Added for intent-based generation
-  /** Full user prompt for intent analysis */
-  userFullPrompt?: string;
-  /** Total images in folder */
-  imageCount?: number;
-  /** 0-based index of current image */
-  imageIndex?: number;
-  /** Pre-analyzed intent (to avoid repeated analysis) */
-  cachedIntent?: IntentAnalysis;
-}
-
-// Re-export for consumers
-export type { IntentAnalysis, IntentMode };
-
-// =============================================================================
-// Intent Cache - Prevents redundant API calls for same folder
-// =============================================================================
-
-/**
- * Cache intent analysis per folder operation to avoid redundant API calls
- * Key: folderOperation::userFullPrompt (truncated to 200 chars), Value: IntentAnalysis
- */
-const intentCache = new Map<string, IntentAnalysis>();
-
-/**
- * Generate cache key from folder operation and user prompt
- */
-function getIntentCacheKey(folderOperation: string, userFullPrompt: string): string {
-  return `${folderOperation}::${userFullPrompt}`.substring(0, 200);
-}
-
-/**
- * Get cached intent or analyze and cache the result
- *
- * @param folderOperation - The operation string from folder parsing
- * @param userFullPrompt - The complete user prompt
- * @param imageCount - Number of images in the folder
- * @returns Cached or freshly analyzed IntentAnalysis
- */
-async function getOrAnalyzeIntent(
-  folderOperation: string,
-  userFullPrompt: string,
-  imageCount: number
-): Promise<IntentAnalysis> {
-  const cacheKey = getIntentCacheKey(folderOperation, userFullPrompt);
-
-  if (intentCache.has(cacheKey)) {
-    return intentCache.get(cacheKey)!;
-  }
-
-  const intent = await analyzeUserIntent(folderOperation, userFullPrompt, imageCount);
-  intentCache.set(cacheKey, intent);
-  return intent;
-}
-
-/**
- * Clear intent cache - call between jobs to prevent memory buildup
- */
-export function clearIntentCache(): void {
-  intentCache.clear();
-}
 
 // =============================================================================
 // JSON Parsing Utilities
 // =============================================================================
 
-/**
- * Clean JSON response from Claude by removing markdown code blocks
- *
- * @param text - Raw text response from Claude
- * @returns Cleaned JSON string ready for parsing
- */
 function cleanJsonResponse(text: string): string {
   let cleaned = text.trim();
-
-  // Remove markdown code block markers
   if (cleaned.startsWith('```json')) {
     cleaned = cleaned.slice(7);
   } else if (cleaned.startsWith('```')) {
     cleaned = cleaned.slice(3);
   }
-
   if (cleaned.endsWith('```')) {
     cleaned = cleaned.slice(0, -3);
   }
-
   return cleaned.trim();
 }
 
-/**
- * Parse JSON response with error handling
- *
- * @param text - Raw text to parse
- * @returns Parsed object
- * @throws Error with clear message if parsing fails
- */
 function parseJsonResponse<T>(text: string): T {
   const cleaned = cleanJsonResponse(text);
-
   try {
     return JSON.parse(cleaned) as T;
   } catch (error) {
@@ -124,55 +33,81 @@ function parseJsonResponse<T>(text: string): T {
   }
 }
 
+// =============================================================================
+// Batch Prompt Generator - ONE Claude call per folder
+// =============================================================================
+
 /**
- * Analyze user intent to determine prompt generation strategy
+ * Generate ALL unique prompts for a folder in ONE Claude call.
  *
- * Uses Claude Sonnet 4.5 with extended thinking (budget_tokens: 3000)
- * to analyze whether the user wants:
- * - uniform: Same prompt for all images (most common)
- * - explicit-variations: User specified what varies
- * - implicit-variations: User wants variations but didn't specify what
+ * This ensures all prompts are truly distinct because Claude sees all of them
+ * at once and can make each one meaningfully different.
  *
- * CRITICAL: If confidence < 0.7, mode is forced to 'uniform'
- *
- * @param folderOperation - The operation string from folder parsing
- * @param userFullPrompt - The complete user prompt
- * @param imageCount - Number of images in the folder
- * @returns IntentAnalysis with mode, confidence, basePrompt, and optionally variations
+ * @param folderOperation - The operation string from folder parsing (what to do)
+ * @param userFullPrompt - The complete user prompt (full context)
+ * @param count - How many unique prompts to generate
+ * @returns Array of unique prompt strings, length === count
  */
-export async function analyzeUserIntent(
+export async function generateAllFolderPrompts(
   folderOperation: string,
   userFullPrompt: string,
-  imageCount: number
-): Promise<IntentAnalysis> {
+  count: number
+): Promise<string[]> {
+  // If only 1 prompt needed, no need for variations - just clean up the operation
+  if (count <= 1) {
+    const single = await generateSinglePrompt(folderOperation, userFullPrompt);
+    return [single];
+  }
+
   try {
     const client = getAnthropicClient();
-    const prompt = buildIntentAnalysisPrompt(folderOperation, userFullPrompt, imageCount);
+
+    const prompt = `You are generating image generation prompts for an AI image tool.
+
+<user_request>
+${userFullPrompt}
+</user_request>
+
+<folder_operation>
+${folderOperation}
+</folder_operation>
+
+<task>
+Generate exactly ${count} UNIQUE image generation prompts based on the user's request above.
+
+Each prompt should be a complete, standalone instruction for an AI image generator.
+The prompts are for the SAME source image but each should produce a DISTINCTLY DIFFERENT result.
+
+CRITICAL RULES:
+1. Each prompt MUST be meaningfully different from every other prompt
+2. Stay faithful to what the user asked for - do NOT add details they didn't request
+3. Vary things the user asked to vary (angles, poses, styles, etc.)
+4. If the user specified specific variations (e.g., "front view, back view, side view"), use those EXACTLY
+5. If the user wants variations but didn't specify what, vary: angle, pose, composition, or styling
+6. Each prompt should be 1-3 sentences, clear and direct
+7. Do NOT include numbering, labels, or prefixes - just the prompt text
+8. Preserve all user requirements (background color, style, resolution, etc.) in EVERY prompt
+</task>
+
+<output_format>
+Respond with ONLY a JSON array of ${count} prompt strings. No markdown, no explanation.
+Example: ["prompt 1 text here", "prompt 2 text here", "prompt 3 text here"]
+</output_format>`;
 
     const response = await withRetry(async () => {
       return client.messages.create({
         model: CLAUDE_MODEL,
-        max_tokens: 4000,
+        max_tokens: 16000,
         thinking: {
           type: "enabled",
-          budget_tokens: 3000
+          budget_tokens: 5000
         },
         messages: [{
           role: "user",
           content: prompt
         }]
       });
-    }, 'Analyze user intent');
-
-    // Extract thinking block for debugging (log first 200 chars)
-    let reasoning: string | undefined;
-    for (const block of response.content) {
-      if (block.type === 'thinking') {
-        reasoning = block.thinking.substring(0, 200);
-        // console.log('[Intent Analysis] Reasoning:', reasoning);
-        break;
-      }
-    }
+    }, `Generate ${count} folder prompts`);
 
     // Extract text response
     let textContent = '';
@@ -184,254 +119,131 @@ export async function analyzeUserIntent(
     }
 
     if (!textContent) {
-      throw new Error('No text response from intent analysis');
+      throw new Error('No text response from batch prompt generation');
     }
 
-    // Parse JSON response
-    const parsed = parseJsonResponse<{
-      mode: IntentMode;
-      confidence: number;
-      basePrompt: string;
-      variations?: string[];
-    }>(textContent);
+    // Parse JSON array
+    const prompts = parseJsonResponse<string[]>(textContent);
 
-    // Log raw parsed result
-    console.log(`[Intent Analysis] Raw result: mode=${parsed.mode}, confidence=${parsed.confidence.toFixed(2)}`);
-    console.log(`[Intent Analysis] BasePrompt: "${parsed.basePrompt.substring(0, 100)}..."`);
-    if (parsed.variations && parsed.variations.length > 0) {
-      console.log(`[Intent Analysis] Variations (${parsed.variations.length}): ${JSON.stringify(parsed.variations)}`);
-    } else {
-      console.log(`[Intent Analysis] No variations extracted`);
+    // Validate we got the right number
+    if (!Array.isArray(prompts) || prompts.length === 0) {
+      throw new Error(`Expected array of ${count} prompts, got: ${typeof prompts}`);
     }
 
-    // Build result with reasoning
-    const result: IntentAnalysis = {
-      mode: parsed.mode,
-      confidence: parsed.confidence,
-      basePrompt: parsed.basePrompt,
-      variations: parsed.variations,
-      reasoning
-    };
+    // Log results
+    console.log(`[Prompt Generator] Generated ${prompts.length} unique prompts for folder`);
+    prompts.forEach((p, i) => {
+      console.log(`[Prompt Generator]   ${i + 1}. "${p.substring(0, 80)}..."`);
+    });
 
-    // Force uniform mode if confidence is low
-    // Lowered threshold from 0.7 to 0.5 to be more permissive
-    if (result.confidence < 0.5) {
-      console.warn(
-        `[Intent Analysis] LOW CONFIDENCE (${result.confidence.toFixed(2)}) - forcing to uniform mode. ` +
-        `Original mode: ${result.mode}, variations: ${JSON.stringify(result.variations)}`
-      );
-      result.mode = 'uniform';
-      // Clear variations since we're now uniform
-      result.variations = undefined;
-    } else {
-      console.log(
-        `[Intent Analysis] CONFIDENCE OK (${result.confidence.toFixed(2)}) - keeping mode: ${result.mode}`
-      );
+    // If we got fewer than requested, pad by cycling
+    while (prompts.length < count) {
+      prompts.push(prompts[prompts.length % prompts.length]);
     }
 
-    return result;
+    // If we got more than requested, trim
+    return prompts.slice(0, count);
 
   } catch (error) {
-    // On any failure, return safe default (uniform mode)
-    console.error(
-      '[Intent Analysis] Failed, using default uniform mode:',
-      error instanceof Error ? error.message : error
-    );
-
-    return {
-      mode: 'uniform',
-      confidence: 0.5,
-      basePrompt: folderOperation,
-      reasoning: `Fallback due to error: ${error instanceof Error ? error.message : 'Unknown error'}`
-    };
+    console.error('[Prompt Generator] Batch generation failed, using fallback:', error);
+    // Fallback: return the operation repeated (uniform)
+    return Array(count).fill(folderOperation);
   }
 }
 
-// =============================================================================
-// Mode Handlers - Build prompts based on intent mode
-// =============================================================================
-
 /**
- * Build prompt for uniform mode - same prompt for all images
- *
- * @param intent - Analyzed intent with basePrompt
- * @returns The base prompt (unchanged for all images)
+ * Generate a single cleaned-up prompt from user request (for uniform/single-image cases)
  */
-function buildUniformPrompt(intent: IntentAnalysis): string {
-  // Simple: use base prompt for all images
-  // No embellishments, just what user asked for
-  return intent.basePrompt;
-}
-
-/**
- * Build prompt for explicit variations mode - cycle through user-specified variations
- *
- * @param intent - Analyzed intent with variations array
- * @param imageIndex - 0-based index of current image
- * @returns Prompt combining base with variation at imageIndex
- */
-function buildExplicitVariationPrompt(
-  intent: IntentAnalysis,
-  imageIndex: number
-): string {
-  // Use variation at imageIndex, cycling if more images than variations
-  const variations = intent.variations || [];
-  if (variations.length === 0) {
-    // Fallback to base prompt if no variations
-    console.warn('[Prompt Generator] explicit-variations mode but no variations array - falling back to basePrompt');
-    return intent.basePrompt;
-  }
-
-  const variationIndex = imageIndex % variations.length;
-  const variation = variations[variationIndex];
-
-  // Put variation at the BEGINNING so it's obvious and can't be missed
-  // Format: "[VARIATION X: description] base prompt"
-  const combinedPrompt = `[POSE: ${variation}] ${intent.basePrompt}`;
-
-  console.log(`[Prompt Generator] ===== VARIATION ${variationIndex + 1}/${variations.length} =====`);
-  console.log(`[Prompt Generator] variation = "${variation}"`);
-  console.log(`[Prompt Generator] basePrompt = "${intent.basePrompt.substring(0, 50)}..."`);
-  console.log(`[Prompt Generator] RESULT = "${combinedPrompt.substring(0, 80)}..."`);
-
-  return combinedPrompt;
-}
-
-/**
- * Build prompt for implicit variations mode - use Claude to generate unique variation
- *
- * @param intent - Analyzed intent with basePrompt
- * @param imageIndex - 0-based index of current image
- * @param imageCount - Total number of images
- * @returns AI-generated prompt variation
- */
-async function buildImplicitVariationPrompt(
-  intent: IntentAnalysis,
-  imageIndex: number,
-  imageCount: number
+async function generateSinglePrompt(
+  folderOperation: string,
+  userFullPrompt: string
 ): Promise<string> {
-  // Use Claude to generate a unique variation
-  const client = getAnthropicClient();
-
-  const variationPrompt = `Generate variation ${imageIndex + 1} of ${imageCount} for this prompt: "${intent.basePrompt}"
-
-Keep the core operation EXACTLY the same, but vary ONE aspect to make this variation unique.
-Options for variation: angle, pose, lighting, composition, style emphasis.
-
-CRITICAL RULES:
-- Do NOT add details not in the original prompt
-- Keep it concise (1-2 sentences max)
-- Make each variation meaningfully different from others
-
-Respond with ONLY the varied prompt, no explanation or formatting.`;
-
   try {
+    const client = getAnthropicClient();
+
+    const prompt = `You are generating an image generation prompt for an AI image tool.
+
+<user_request>
+${userFullPrompt}
+</user_request>
+
+<folder_operation>
+${folderOperation}
+</folder_operation>
+
+<task>
+Create ONE clear, complete image generation prompt based on the user's request.
+Stay faithful to what the user asked for. Do NOT add details they didn't request.
+Keep it 1-3 sentences, clear and direct.
+</task>
+
+Respond with ONLY the prompt text. No quotes, no explanation, no formatting.`;
+
     const response = await withRetry(async () => {
       return client.messages.create({
         model: CLAUDE_MODEL,
         max_tokens: 500,
         messages: [{
           role: "user",
-          content: variationPrompt
+          content: prompt
         }]
       });
-    }, `Generate implicit variation ${imageIndex + 1}/${imageCount}`);
+    }, 'Generate single prompt');
 
     const textBlock = response.content.find(b => b.type === 'text');
     if (!textBlock || textBlock.type !== 'text') {
-      return intent.basePrompt; // Fallback
+      return folderOperation;
     }
 
     return textBlock.text.trim();
   } catch (error) {
-    console.error(`[Prompt Generator] Failed to generate implicit variation ${imageIndex + 1}:`, error);
-    return intent.basePrompt; // Fallback
+    console.error('[Prompt Generator] Single prompt generation failed:', error);
+    return folderOperation;
   }
 }
 
-// =============================================================================
-// Main Prompt Generator
-// =============================================================================
-
 /**
- * Generate a per-generation prompt based on user intent.
- *
- * Phase 26 Implementation:
- * - UNIFORM: Returns same basePrompt for all images
- * - EXPLICIT_VARIATIONS: Cycles through user-specified variations
- * - IMPLICIT_VARIATIONS: Calls Claude to generate unique variation per image
- *
- * Fallback behavior:
- * - If no userFullPrompt provided: returns folderOperation (Phase 25 behavior)
- * - On any error: returns folderOperation (safe default)
- *
- * @param options - Prompt generation configuration
- * @returns Generated prompt text
+ * Legacy function - kept for backward compatibility but simplified.
+ * New code should use generateAllFolderPrompts() instead.
  */
-export async function generatePerImagePrompt(
-  options: PromptGenerationOptions
-): Promise<string> {
+export async function generatePerImagePrompt(options: {
+  folderOperation: string;
+  fileName: string;
+  imageUrl?: string;
+  photoMode: 'reference' | 'analysis';
+  userFullPrompt?: string;
+  imageCount?: number;
+  imageIndex?: number;
+  cachedPrompts?: string[];
+}): Promise<string> {
   const {
     folderOperation,
     userFullPrompt,
     imageCount = 1,
     imageIndex = 0,
-    cachedIntent
+    cachedPrompts
   } = options;
 
-  try {
-    // If no userFullPrompt provided, fall back to Phase 25 behavior
-    if (!userFullPrompt) {
-      return folderOperation;
-    }
+  // If we have pre-generated prompts from generateAllFolderPrompts, use them
+  if (cachedPrompts && cachedPrompts.length > 0) {
+    const promptIndex = imageIndex % cachedPrompts.length;
+    const prompt = cachedPrompts[promptIndex];
+    console.log(`[Prompt Generator] Using cached prompt ${promptIndex + 1}/${cachedPrompts.length}: "${prompt.substring(0, 80)}..."`);
+    return prompt;
+  }
 
-    // Get or analyze intent (uses cache)
-    const intent = cachedIntent || await getOrAnalyzeIntent(
-      folderOperation,
-      userFullPrompt,
-      imageCount
-    );
-
-    // Log intent analysis result
-    console.log(`[Prompt Generator] ========== INTENT DEBUG ==========`);
-    console.log(`[Prompt Generator] mode=${intent.mode}`);
-    console.log(`[Prompt Generator] confidence=${intent.confidence.toFixed(2)}`);
-    console.log(`[Prompt Generator] variations count=${intent.variations?.length || 0}`);
-    console.log(`[Prompt Generator] variations=${JSON.stringify(intent.variations)}`);
-    console.log(`[Prompt Generator] basePrompt (first 60)="${intent.basePrompt?.substring(0, 60)}..."`);
-    console.log(`[Prompt Generator] imageIndex=${imageIndex}, imageCount=${imageCount}`);
-    console.log(`[Prompt Generator] ===================================`);
-
-    // Generate prompt based on intent mode
-    let generatedPrompt: string;
-    switch (intent.mode) {
-      case 'uniform':
-        generatedPrompt = buildUniformPrompt(intent);
-        console.log(`[Prompt Generator] UNIFORM mode - returning basePrompt`);
-        break;
-
-      case 'explicit-variations':
-        generatedPrompt = buildExplicitVariationPrompt(intent, imageIndex);
-        console.log(`[Prompt Generator] EXPLICIT mode - variation ${imageIndex}`);
-        break;
-
-      case 'implicit-variations':
-        generatedPrompt = await buildImplicitVariationPrompt(intent, imageIndex, imageCount);
-        console.log(`[Prompt Generator] IMPLICIT mode - variation ${imageIndex}`);
-        break;
-
-      default:
-        // Exhaustive check - should never reach
-        console.warn(`[Prompt Generator] Unknown intent mode: ${(intent as IntentAnalysis).mode}`);
-        generatedPrompt = folderOperation;
-    }
-
-    console.log(`[Prompt Generator] FINAL PROMPT (first 80): "${generatedPrompt.substring(0, 80)}..."`);
-    console.log(`[Prompt Generator] STARTS WITH [POSE: ${generatedPrompt.startsWith('[POSE:') ? 'YES' : 'NO'}`);
-    return generatedPrompt;
-  } catch (error) {
-    // Fallback: Phase 25 behavior (pass-through)
-    console.error('[Prompt Generator] Failed, using fallback:', error);
+  // Fallback: no pre-generated prompts
+  if (!userFullPrompt) {
     return folderOperation;
   }
+
+  // Generate on the fly (shouldn't happen with new flow, but safe fallback)
+  const prompts = await generateAllFolderPrompts(folderOperation, userFullPrompt, imageCount);
+  const promptIndex = imageIndex % prompts.length;
+  return prompts[promptIndex];
+}
+
+// Legacy exports for backward compatibility
+export function clearIntentCache(): void {
+  // No-op - intent cache no longer used
 }

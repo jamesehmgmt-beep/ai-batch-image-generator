@@ -130,7 +130,9 @@ export class GenerationQueueManager {
       strategy.validateParams(params);
 
       // Step 6: Create task via strategy
+      console.log(`[Queue] CALLING strategy.createTask for generation ${job.id} (model: ${job.model})`);
       const taskId = await strategy.createTask(params);
+      console.log(`[Queue] Got taskId ${taskId} for generation ${job.id}`);
 
       // Step 7: Update database with task_id
       const { error: taskIdError } = await this.supabase
@@ -196,6 +198,7 @@ export class GenerationQueueManager {
    * Implements PROC-04: Never skip - retry until success or non-retryable error
    */
   private async executeWithRetry(job: GenerationJob): Promise<GenerationResult> {
+    console.log(`[Queue] executeWithRetry STARTED for generation ${job.id} (model: ${job.model}, file: ${job.sourceFileName})`);
     const retryState: RetryState = {
       attemptNumber: 0,
       totalBackoffMs: 0,

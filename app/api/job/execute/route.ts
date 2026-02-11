@@ -1,5 +1,5 @@
 // app/api/job/execute/route.ts
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse, after } from 'next/server';
 import { getQueueManager } from '@/lib/queue/generation-queue';
 import { getRecoveryManager } from '@/lib/queue/recovery-manager';
 import { createServerSupabaseClient } from '@/lib/supabase-server';
@@ -146,13 +146,19 @@ export async function POST(req: NextRequest) {
     // Step 7: Get queue manager instance and queue all generations
     const queueManager = getQueueManager();
 
-    // Add all generations to queue (non-blocking)
-    // DO NOT await - let queue process in background
-    queueManager.addBatch(generationJobs).catch((error) => {
-      console.error('[Execute] Queue processing error:', error);
-    });
+    // Start queue processing - use after() to keep alive after response is sent
+    // Without after(), Next.js App Router terminates background work when the response is sent
+    const batchPromise = queueManager.addBatch(generationJobs);
 
-    // console.log(`[Execute] Job ${jobId} queued. Recovery manager active: ${recoveryManager.isActive()}`);
+    after(async () => {
+      try {
+        console.log(`[Execute] after() - Queue processing started for job ${jobId} (${generationJobs.length} generations)`);
+        await batchPromise;
+        console.log(`[Execute] after() - Queue processing completed for job ${jobId}`);
+      } catch (error) {
+        console.error(`[Execute] after() - Queue processing error for job ${jobId}:`, error);
+      }
+    });
 
     // Step 8: Return immediately with job summary
     const queueStatus = queueManager.getStatus();

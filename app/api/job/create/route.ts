@@ -4,7 +4,7 @@ import { createJob } from '@/lib/job/job-manager';
 import { ParsedJobSchema } from '@/lib/ai/schemas/job';
 import { ParsedJob } from '@/lib/types/job';
 import { v4 as uuidv4 } from 'uuid';
-import { generatePerImagePrompt, clearIntentCache } from '@/lib/ai/prompt-generator';
+import { generateAllFolderPrompts, clearIntentCache } from '@/lib/ai/prompt-generator';
 
 /**
  * POST /api/job/create
@@ -119,7 +119,8 @@ export async function POST(req: NextRequest) {
       image_size: string | null;
     }> = [];
 
-    // For each folder in the parsed job
+    // Phase 27: Generate ALL unique prompts per folder in ONE Claude call.
+    // This ensures prompts are truly distinct - one AI sees all prompts at once.
     for (const folder of validatedParsedJob.job.folders) {
       // Try exact match first
       let folderFiles = filesByFolder[folder.folderPath] || [];
@@ -131,33 +132,24 @@ export async function POST(req: NextRequest) {
           k => k.toLowerCase() === lowerFolderPath
         );
         if (matchingKey) {
-          // console.log(`[Job Create] Case-insensitive match: "${folder.folderPath}" -> "${matchingKey}"`);
           folderFiles = filesByFolder[matchingKey] || [];
         }
       }
-
-      // console.log(`[Job Create] Folder "${folder.folderPath}" has ${folderFiles.length} files`);
 
       if (folderFiles.length === 0) {
         console.warn(`[Job Create] WARNING: No files found for folder "${folder.folderPath}". Available keys: ${Object.keys(filesByFolder).join(', ')}`);
       }
 
-      // BUGF-04: Filter out excluded files before creating generation records
+      // Filter out excluded files
       const excludedFileNames = folder.excludedFiles || [];
       const validFiles = folderFiles.filter((url: string) => {
         const fileName = url.split('/').pop() || '';
-        const isExcluded = excludedFileNames.includes(fileName);
-        if (isExcluded) {
-          // console.log(`[Job Create] Excluding file "${fileName}" from folder "${folder.folderPath}"`);
-        }
-        return !isExcluded;
+        return !excludedFileNames.includes(fileName);
       });
-
-      // console.log(`[Job Create] Folder "${folder.folderPath}": ${folderFiles.length} total files, ${validFiles.length} after exclusions`);
 
       const photoMode = folder.photoMode || 'reference';
 
-      // Get model from folder config - cast to access model-specific fields
+      // Get model from folder config
       const folderAny = folder as typeof folder & {
         model?: string;
         quality?: string;
@@ -167,86 +159,66 @@ export async function POST(req: NextRequest) {
       const model = folderAny.model || validatedParsedJob.job?.model || 'nano-banana-pro';
       const isNanoBanana = model === 'nano-banana-pro';
 
-      // Phase 26: Check for generationCount (e.g., "4 variations per image")
-      // If set, create that many generations per file (for variations)
-      // If not set, default to 1 generation per file
       const generationsPerFile = folderAny.generationCount || 1;
 
       console.log(`[Job Create] Folder "${folder.folderPath}": ${validFiles.length} files × ${generationsPerFile} variations = ${validFiles.length * generationsPerFile} generations`);
-      console.log(`[Job Create] User prompt: "${(userPrompt || '').substring(0, 100)}..."`);
 
-      // Phase 26: imageCount for intent analysis = number of variations requested
-      // This tells the prompt generator how many unique prompts to cycle through
-      const imageCount = generationsPerFile;
-
-      // For ANALYSIS mode: Include ALL folder files as context for EACH generation
-      // This gives kie.ai full context of what's being analyzed
-      // For REFERENCE mode: Only include the individual source file
+      // Phase 27: Generate ALL unique prompts for this folder in ONE call
+      // ONE AI call = ALL prompts generated together = truly unique prompts
+      let folderPrompts: string[];
+      if (userPrompt && generationsPerFile > 1) {
+        // Multiple variations per image: generate all unique prompts at once
+        folderPrompts = await generateAllFolderPrompts(
+          folder.operation,
+          userPrompt,
+          generationsPerFile
+        );
+        console.log(`[Job Create] Generated ${folderPrompts.length} unique prompts for folder "${folder.folderPath}":`);
+        folderPrompts.forEach((p, i) => console.log(`[Job Create]   ${i + 1}. "${p.substring(0, 80)}..."`));
+      } else if (userPrompt) {
+        // Single generation per image: generate one prompt
+        folderPrompts = await generateAllFolderPrompts(
+          folder.operation,
+          userPrompt,
+          1
+        );
+      } else {
+        // No user prompt: use folder operation as-is
+        folderPrompts = [folder.operation];
+      }
 
       for (const fileUrl of validFiles) {
-        // Extract filename from URL
         const fileName = fileUrl.split('/').pop() || 'unknown';
 
         let allReferenceUrls: string[];
-
         if (photoMode === 'analysis' && generationsPerFile <= 1) {
-          // ANALYSIS MODE with single generation per image: Include ALL valid folder files for context
-          // Source file first, then all other files from folder, then user's extra references
           const otherValidFiles = validFiles.filter((f: string) => f !== fileUrl);
           allReferenceUrls = [fileUrl, ...otherValidFiles, ...validatedReferenceUrls].slice(0, 8);
         } else {
-          // REFERENCE MODE or MULTIPLE VARIATIONS per image:
-          // Only the source file + user's extra references.
-          // When creating variations per image (generationsPerFile > 1), each image's
-          // variations should only reference that specific source image, not all folder images.
           allReferenceUrls = [fileUrl, ...validatedReferenceUrls].slice(0, 8);
         }
 
-        // Create generationsPerFile generations for this file (for variations)
+        // Create generationsPerFile generations per file, using the pre-generated prompts
         for (let variationIndex = 0; variationIndex < generationsPerFile; variationIndex++) {
-          // Generate per-generation prompt (Phase 26)
-          // Intent-based prompt generation with fallback to Phase 25 behavior
-          // variationIndex tells the prompt generator which variation to use (0, 1, 2, 3 for 4 variations)
-          const generationPrompt = await generatePerImagePrompt({
-            folderOperation: folder.operation,
-            fileName: fileName,
-            imageUrl: fileUrl,
-            photoMode: photoMode,
-            // Phase 26: Full context for intent analysis
-            userFullPrompt: userPrompt || '',
-            imageCount: imageCount,
-            imageIndex: variationIndex,
-          });
+          // Index into the pre-generated prompts array (cycle if needed)
+          const promptIndex = variationIndex % folderPrompts.length;
+          const generationPrompt = folderPrompts[promptIndex];
 
-          // Log generated prompt for debugging - show end of prompt where variation is
-          if (variationIndex === 0 || generationsPerFile > 1) {
-            const promptEnd = generationPrompt.length > 80
-              ? `...${generationPrompt.substring(generationPrompt.length - 80)}`
-              : generationPrompt;
-            console.log(`[Job Create] Prompt for ${fileName} var ${variationIndex + 1}: ${promptEnd}`);
-          }
-
-          // Log what we're about to store
-          console.log(`[Job Create] STORING prompt for ${fileName} var ${variationIndex + 1}:`);
-          console.log(`[Job Create]   prompt length: ${generationPrompt.length}`);
-          console.log(`[Job Create]   prompt ends with: "...${generationPrompt.slice(-60)}"`);
+          console.log(`[Job Create] ${fileName} var ${variationIndex + 1}: "${generationPrompt.substring(0, 80)}..."`);
 
           generationRecords.push({
-            id: uuidv4(), // Explicitly generate UUID
+            id: uuidv4(),
             job_id: job.id,
             folder_path: folder.folderPath,
             operation: folder.operation,
             prompt: generationPrompt,
             state: 'pending',
             source_file_name: fileName,
-            // Include appropriate reference images based on photo mode
             reference_image_urls: allReferenceUrls,
             model: model,
-            // resolution is NOT NULL in database - use '2K' as default for both models
             resolution: folder.resolution || '2K',
             aspect_ratio: folder.aspectRatio || '1:1',
             photo_mode: photoMode,
-            // Seedream-specific fields (nullable in database)
             quality: !isNanoBanana ? (folderAny.quality || 'basic') : null,
             image_size: !isNanoBanana ? (folderAny.imageSize || 'landscape_16_9') : null,
           });
